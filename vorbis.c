@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "bs.h"
 #include "err.h"
@@ -286,7 +287,10 @@ void read_setup_header(struct bitstream_reader * br, struct vorbis_header * v) {
         if (c->subclasses)
         {
           c->masterbook = read_bits(br, 8);
+
           expect( c->masterbook < v->codebook_count );
+          // I'm not trying to do a lookup with this later
+          expect(v->codebooks[c->masterbook].lookup_type == 0);
         }
 
         c->subclass_books_count = 1 << c->subclasses;
@@ -344,6 +348,8 @@ void read_setup_header(struct bitstream_reader * br, struct vorbis_header * v) {
     r->classifications = read_bits(br, 6) + 1;
     r->classbook = read_bits(br, 8);
     expect( r->classbook < v->codebook_count );
+    // I'm not trying to do a lookup with this later
+    expect( v->codebooks[r->classbook].lookup_type == 0 );
 
     r->cascade = malloc(sizeof(uint8_t) * r->classifications);
     expect(r->cascade);
@@ -424,15 +430,24 @@ void read_setup_header(struct bitstream_reader * br, struct vorbis_header * v) {
 
     expect(read_bits(br, 2) == 0);
 
+    m->mux = malloc(sizeof(uint8_t) * v->audio_channels);
+    expect(m->mux);
+      
     if (m->submap_count > 1)
     {
-      m->mux = malloc(sizeof(uint8_t) * v->audio_channels);
-      expect(m->mux);
-      
       for (unsigned int j = 0; j < v->audio_channels; j += 1)
       {
         m->mux[j] = read_bits(br, 4);
         expect(m->mux[j] < m->submap_count);
+      }
+    }
+    else
+    {
+      // NOTE: vorbis_mapping_mux is unspecified in the spec with only one
+      // submapping, but it is clear that it needs to be all 0
+      for (unsigned int j = 0; j < v->audio_channels; j += 1)
+      {
+        m->mux[j] = 0;
       }
     }
 
@@ -473,3 +488,406 @@ void read_setup_header(struct bitstream_reader * br, struct vorbis_header * v) {
   expect( read_bits(br, 1) == 1 );
 }
 
+struct code_reader * create_code_readers(struct vorbis_header * v)
+{
+  struct code_reader * crs = malloc(sizeof(struct code_reader) * v->codebook_count);
+  expect(crs);
+  
+  uint32_t masks[33];
+  for (unsigned int i = 1; i <= 32; i += 1)
+  {
+    masks[i] = (UINT32_C(1) << (32 - i)) - 1;
+    masks[i] = ~masks[i];
+  }
+
+  for (unsigned int i = 0; i < v->codebook_count; i += 1)
+  {
+    struct codebook * cb = &v->codebooks[i];
+    struct code_reader * cr = &crs[i];
+
+    cr->count = cb->entry_count;
+    cr->codewords = malloc(sizeof(uint32_t) * cr->count);
+    expect(cr->codewords);
+    cr->lengths = malloc(sizeof(uint8_t) * cr->count);
+    expect(cr->lengths);
+    cr->used = malloc(sizeof(bool) * cr->count);
+    expect(cr->used);
+
+    #if 0
+    printf("codebook %d\n", i);
+    printf("type: %s\n", cb->ordered ? "ordered" : (cb->sparse ? "sparse" : "nonsparse"));
+    #endif
+
+    // determine codewords
+    bool all1 = false;
+    bool exhausted[33] = {0};
+    uint32_t next_codewords[33] = {0};
+
+    for (unsigned int j = 0; j < cb->entry_count; j += 1)
+    {
+      unsigned int length = cb->entry_lengths[j];
+      expect( length <= 32 );
+
+      if (length > 0)
+      {
+        cr->used[j] = true;
+        cr->lengths[j] = length;
+
+        expect(!exhausted[length]);
+        uint32_t codeword = next_codewords[length];
+        bool collided;
+        uint32_t next_step = 0;
+        do
+        {
+          // check for collisions
+          collided = false;
+          for (unsigned int k = 0; k < j; k += 1)
+          {
+            if (cr->used[k])
+            {
+              uint32_t mask = masks[length];
+              if (cr ->lengths[k] < length)
+              {
+                mask = masks[cr->lengths[k]];
+              }
+
+              if ((cr->codewords[k] & mask) == (codeword & mask))
+              {
+                collided = true;
+                // next attempt must at least differ within the mask
+                next_step = (codeword + (~mask) + 1) & mask;
+                expect(next_step > codeword);
+                codeword = next_step;
+                break;
+              }
+            }
+          }
+        }
+        while (collided);
+
+        next_codewords[length] = codeword + (UINT32_C(1) << (32 - length));
+        if (next_codewords[length] < codeword)
+        {
+          exhausted[length] = true;
+        }
+
+        cr->codewords[j] = codeword;
+
+        if (cr->codewords[j]  == (-1 & masks[length]))
+        {
+          expect(exhausted[length]);
+          all1 = true;
+        }
+
+        #if 0
+        printf("entry %3u: length %3d codeword ", j, (int)length);
+        for (int k = 31; k >= 32 - length; k -= 1)
+        {
+          printf("%c", ( codeword & (UINT32_C(1) << k) ) ? '1' : '0');
+        }
+        printf("\n");
+        #endif
+      }
+      else
+      {
+        cr->used[j] = false;
+      }
+    } // end entry loop
+
+    // make sure we hit the end of the tree
+    expect(all1);
+
+    // build tree
+    cr->decoder = NULL;
+    /*
+    cr->decoder = malloc(sizeof(struct code_tree_node));
+    expect(cr->decoder);
+    cr->decoder.is_leaf = false;
+    cr->decoder.left = cr->decoder.right = NULL;
+    */
+
+    for (unsigned int j = 0; j < cr->count; j += 1)
+    {
+      if (!cr->used[j])
+      {
+        continue;
+      }
+
+      struct code_tree_node ** pcur = &cr->decoder;
+      struct code_tree_node * cur = cr->decoder;
+
+      for (int k = 31; k >= 32 - cr->lengths[j]; k -= 1)
+      {
+        if (!cur)
+        {
+          cur = malloc(sizeof(struct code_tree_node));
+          expect(cur);
+          *pcur = cur;
+          cur->is_leaf = false;
+          cur->children[0] = cur->children[1] = NULL;
+        }
+
+        unsigned int next = (cr->codewords[j] >> k) & 1;
+        pcur = &cur->children[next];
+        cur = cur->children[next];
+      }
+
+      expect(!cur);
+      cur = malloc(sizeof(struct code_tree_node));
+      expect(cur);
+      *pcur = cur;
+      cur->is_leaf = true;
+      cur->leaf = j;
+    }
+  }
+
+  return crs;
+}
+
+uint32_t read_code(struct bitstream_reader * br, struct code_reader * cr)
+{
+  struct code_tree_node * cur = cr->decoder;
+
+  expect(!cur->is_leaf);
+  do
+  {
+    cur = cur->children[read_bits(br, 1)];
+    expect(cur);
+  }
+  while (!cur->is_leaf);
+
+  return cur->leaf;
+}
+
+
+void read_vorbis_audio_packet(
+  struct bitstream_reader * br,
+  struct vorbis_header * v,
+  struct code_reader * crs
+) {
+
+  printf("decoding packet\n");
+  // audio packet type
+  expect( read_bits(br, 1) == 0 );
+
+  unsigned int mode_number = read_bits(br, ilog(v->mode_count - 1));
+  expect( mode_number < v->mode_count );
+
+  struct mode * mode = &v->modes[mode_number];
+
+  bool blockflag = mode->blockflag;
+
+  unsigned int blocksize;
+
+  if (blockflag)
+  {
+    // long window
+    bool previous_window_flag = read_bits(br, 1);
+    bool next_window_flag = read_bits(br, 1);
+
+    blocksize = v->blocksize_1;
+  }
+  else
+  {
+    blocksize = v->blocksize_0;
+  }
+
+  struct mapping * mapping = &v->mappings[mode->mapping];
+
+  bool no_residue[v->audio_channels];
+  for (unsigned int i = 0; i < v->audio_channels; i += 1)
+  {
+    no_residue[i] = false;
+  }
+
+  // decode floors
+  for (unsigned int channel = 0; channel < v->audio_channels; channel += 1)
+  {
+    unsigned int submap_number = mapping->mux[channel];
+    unsigned int floor_number = mapping->submaps[submap_number].floor;
+
+    struct floor * floor = &v->floors[floor_number];
+    if (floor->type == 1)
+    {
+      struct floor1 * f = &floor->type1;
+
+      bool nonzero = read_bits(br, 1);
+      if (!nonzero)
+      {
+        no_residue[channel] = true;
+        continue;
+      }
+
+      static const unsigned int ranges[4] = {256, 128, 86, 64};
+      unsigned int range = ranges[f->multiplier-1];
+
+      // floor1_Y[0]
+      read_bits(br, ilog(range-1));
+      // floor1_Y[1]
+      read_bits(br, ilog(range-1));
+
+      for (unsigned int i = 0; i < f->partitions; i += 1)
+      {
+        uint8_t class = f->partition_class_list[i];
+        uint8_t cdim = f->classes[class].dimensions;
+        uint8_t cbits = f->classes[class].subclasses;
+        uint32_t csub = (1 << cbits) - 1;
+
+        unsigned int cval = 0;
+        if (cbits > 0)
+        {
+          cval = read_code(br, &crs[f->classes[class].masterbook]);
+          // I don't have lookup supported
+          expect(v->codebooks[f->classes[class].masterbook].lookup_type == 0);
+        }
+
+        for (unsigned int j = 0; j < cdim; j += 1)
+        {
+          uint8_t book = f->classes[class].subclass_books[cval & csub];
+          cval = cval >> cbits;
+
+          if (book != 0xFF)
+          {
+            // floor1_Y[j + offset] 
+            read_code(br, &crs[book]);
+          }
+          else
+          {
+            // floor1_Y[j + offset] = 0
+          }
+        }
+      }
+    }
+    else
+    {
+      // only type 1 supported at the moment
+      expect(false);
+    }
+  } // end floors
+
+  // residues (per submap)
+  for (unsigned int i = 0; i < mapping->submap_count; i += 1)
+  {
+    bool do_not_decode_flag[v->audio_channels];
+    for (unsigned int j = 0; j < v->audio_channels; j += 1)
+    {
+      do_not_decode_flag[j] = false;
+    }
+
+    unsigned int ch = 0;
+    for (unsigned int j = 0; j < v->audio_channels; j += 1)
+    {
+
+      if (mapping->mux[j] == i)
+      {
+        //printf("submap %u has channel %u\n", i, j);
+        if (no_residue[i])
+        {
+          do_not_decode_flag[ch] = true;
+        }
+
+        ch += 1;
+      }
+    }
+
+    unsigned int residue_number = mapping->submaps[i].residue;
+    struct residue * r = &v->residues[residue_number];
+    unsigned int residue_type = r->type;
+
+    unsigned int actual_size = blocksize/2;
+    if (residue_type == 2)
+    {
+      actual_size *= ch;
+    }
+
+    unsigned int limit_residue_begin = r->begin;
+    if (actual_size > limit_residue_begin)
+    {
+      limit_residue_begin = actual_size;
+    }
+    unsigned int limit_residue_end = r->end;
+    if (actual_size > limit_residue_end)
+    {
+      limit_residue_end = actual_size;
+    }
+
+    unsigned int classwords_per_codeword = v->codebooks[r->classbook].dimensions;
+    unsigned int n_to_read = limit_residue_end - limit_residue_begin;
+    unsigned int partitions_to_read = n_to_read / r->partition_size;
+
+    if (n_to_read == 0)
+    {
+      continue;
+    }
+
+    for (unsigned int pass = 0; pass < 8; pass += 1)
+    {
+      unsigned int classifications[ch][classwords_per_codeword+partitions_to_read];
+      unsigned int partition_count = 0;
+
+      while (partition_count < partitions_to_read)
+      {
+        if (pass == 0)
+        {
+          for (unsigned int j = 0; j < ch; j += 1)
+          {
+
+            if (do_not_decode_flag[j])
+            {
+              continue;
+            }
+
+            // I don't have lookup supported
+            expect(v->codebooks[r->classbook].lookup_type == 0);
+            unsigned int temp = read_code(br, &crs[r->classbook]);
+
+            for (int k = classwords_per_codeword-1; k >= 0; k -= 1)
+            {
+              classifications[j][k+partition_count] = temp % r->classifications;
+              temp /= r->classifications;
+            }
+          }
+        } // end if (pass == 0)
+
+        for (unsigned int k = 0; k < classwords_per_codeword && partition_count < partitions_to_read; k += 1)
+        {
+          for (unsigned int j = 0; j < ch; j += 1)
+          {
+            if (do_not_decode_flag[j])
+            {
+              continue;
+            }
+
+            unsigned int vqclass = classifications[j][partition_count];
+            unsigned int vqbook = r->books[vqclass*8 + pass];
+            if (r->cascade[vqclass] & (1 << pass))
+            {
+              if (residue_type == 1)
+              {
+                unsigned int ii = 0;
+                do
+                {
+                  for (unsigned int jj = 0; jj < v->codebooks[vqbook].dimensions; jj += 1)
+                  {
+                    read_code(br, &crs[vqbook]);
+                    ii += 1;
+                  }
+                }
+                while (ii < r->partition_size);
+              }
+              else
+              {
+                expect(false);
+              }
+            }
+          }
+
+          partition_count += 1;
+        }
+      } // end while (partition_count < partitions_to_read)
+    }  // end of pass loop
+
+  } // end of residue (submap loop)
+
+  //abort();
+}

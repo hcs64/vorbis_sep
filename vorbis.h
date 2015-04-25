@@ -124,11 +124,34 @@ struct vorbis_header {
   } * modes;
 };
 
+struct code_tree_node {
+  union {
+    struct code_tree_node * children[2];
+
+    uint32_t leaf;
+  };
+  bool is_leaf;
+};
+
+struct code_reader {
+  unsigned int count;
+  uint32_t * codewords;
+  uint8_t * lengths;
+  bool * used;
+
+  struct code_tree_node * decoder;
+};
+
 unsigned int book_maptype1_quantvals(unsigned int entries, unsigned int dimensions);
 unsigned int ilog(int32_t x);
 
 void read_identification_header(struct bitstream_reader *, struct vorbis_header *);
 void read_comment_header(struct bitstream_reader *, struct vorbis_header *);
 void read_setup_header(struct bitstream_reader *, struct vorbis_header *);
+
+void read_vorbis_audio_packet(struct bitstream_reader *, struct vorbis_header *, struct code_reader * cr);
+
+struct code_reader * create_code_readers(struct vorbis_header *);
+uint32_t read_code(struct bitstream_reader *, struct code_reader *);
 
 #endif // VORBIS_H_INCLUDED

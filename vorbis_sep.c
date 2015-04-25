@@ -50,6 +50,19 @@ int main(int argc, char ** argv) {
       exit(EXIT_FAILURE);
   }
 
+  struct code_reader * crs = create_code_readers(&v);
+
+  while (!ogg_eos(or))
+  {
+    struct bitstream_reader * br = create_bitstream_reader(or);
+
+    read_vorbis_audio_packet(br, &v, crs);
+
+    destroy_bitstream_reader(br);
+  }
+
+  destroy_ogg_reader(or);
+
   return 0;
 }
 

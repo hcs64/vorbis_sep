@@ -191,3 +191,8 @@ check_segment:
 bool ogg_eos(struct ogg_reader * or) {
   return (or->eos && or->segment == or->page.segments);
 }
+
+void destroy_ogg_reader(struct ogg_reader * or) {
+  expect( or->eos );
+  free(or);
+}
