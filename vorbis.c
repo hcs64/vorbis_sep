@@ -666,7 +666,6 @@ void read_vorbis_audio_packet(
   struct code_reader * crs
 ) {
 
-  printf("decoding packet\n");
   // audio packet type
   expect( read_bits(br, 1) == 0 );
 
@@ -682,8 +681,8 @@ void read_vorbis_audio_packet(
   if (blockflag)
   {
     // long window
-    bool previous_window_flag = read_bits(br, 1);
-    bool next_window_flag = read_bits(br, 1);
+    read_bits(br, 1); // previous_window_flag
+    read_bits(br, 1); // next_window_flag
 
     blocksize = v->blocksize_1;
   }
@@ -736,9 +735,8 @@ void read_vorbis_audio_packet(
         unsigned int cval = 0;
         if (cbits > 0)
         {
-          cval = read_code(br, &crs[f->classes[class].masterbook]);
-          // I don't have lookup supported
           expect(v->codebooks[f->classes[class].masterbook].lookup_type == 0);
+          cval = read_code(br, &crs[f->classes[class].masterbook]);
         }
 
         for (unsigned int j = 0; j < cdim; j += 1)
@@ -760,7 +758,7 @@ void read_vorbis_audio_packet(
     }
     else
     {
-      // only type 1 supported at the moment
+      // type 1 supported at the moment
       expect(false);
     }
   } // end floors
@@ -780,8 +778,7 @@ void read_vorbis_audio_packet(
 
       if (mapping->mux[j] == i)
       {
-        //printf("submap %u has channel %u\n", i, j);
-        if (no_residue[i])
+        if (no_residue[j])
         {
           do_not_decode_flag[ch] = true;
         }
@@ -801,12 +798,12 @@ void read_vorbis_audio_packet(
     }
 
     unsigned int limit_residue_begin = r->begin;
-    if (actual_size > limit_residue_begin)
+    if (actual_size < limit_residue_begin)
     {
       limit_residue_begin = actual_size;
     }
     unsigned int limit_residue_end = r->end;
-    if (actual_size > limit_residue_end)
+    if (actual_size < limit_residue_end)
     {
       limit_residue_end = actual_size;
     }
@@ -837,7 +834,6 @@ void read_vorbis_audio_packet(
               continue;
             }
 
-            // I don't have lookup supported
             expect(v->codebooks[r->classbook].lookup_type == 0);
             unsigned int temp = read_code(br, &crs[r->classbook]);
 
@@ -864,19 +860,17 @@ void read_vorbis_audio_packet(
             {
               if (residue_type == 1)
               {
-                unsigned int ii = 0;
+                unsigned int i = 0;
                 do
                 {
-                  for (unsigned int jj = 0; jj < v->codebooks[vqbook].dimensions; jj += 1)
-                  {
-                    read_code(br, &crs[vqbook]);
-                    ii += 1;
-                  }
+                  read_code(br, &crs[vqbook]);
+                  i += v->codebooks[vqbook].dimensions;
                 }
-                while (ii < r->partition_size);
+                while (i < r->partition_size);
               }
               else
               {
+                // only residue type 1 supported so far
                 expect(false);
               }
             }
@@ -889,5 +883,4 @@ void read_vorbis_audio_packet(
 
   } // end of residue (submap loop)
 
-  //abort();
 }

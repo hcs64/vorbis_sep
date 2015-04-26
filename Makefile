@@ -1,6 +1,6 @@
 .PHONY: clean
 
-CFLAGS=-std=c99 -Wall -ggdb
+CFLAGS=-std=c99 -Wall -O2
 
 vorbis_sep: vorbis_sep.o vorbis.o ogg.o bs.o
 

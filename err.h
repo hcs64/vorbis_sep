@@ -4,5 +4,6 @@
 #include <stdlib.h>
 
 #define expect(cond) do { if (!(cond)) { fprintf(stderr, __FILE__ " %d: " #cond " failed\n", __LINE__); exit(EXIT_FAILURE); } } while (0)
+//#define expect(cond) do { if (!(cond)) { fprintf(stderr, __FILE__ " %d: " #cond " failed\n", __LINE__); abort(); } } while (0)
 
 #endif // ERR_H_INCLUDED
