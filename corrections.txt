@@ -1,0 +1,13 @@
+I've been working from http://www.xiph.org/vorbis/doc/Vorbis_I_spec.html dated
+February 27, 2015. There have been a few issues of confusion:
+
+- 4.2.4: does not specify how to set vorbis_mapping_mux if
+  vorbis_mapping_submaps is one (though it is clear it should be 0 for each of
+  the audio_channels)
+
+- 7.2.3: uses floor1_partition_class, while this is called
+  floor1_partition_class_list in the rest of the spec
+
+- 8.6.2: limit_residue_begin and limit_residue_end should be computed with
+ minimum, not maximum
+
